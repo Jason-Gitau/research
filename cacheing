@@ -1,1 +1,230 @@
+Building a caching mechanism for your Langchain AI agent within a Supabase Edge Function involves a few key steps. Since Edge Functions run on Deno, you'll be using the JavaScript/TypeScript version of Langchain and a Deno-compatible Redis client.
 
+Here's a detailed guide:
+
+### 1. Provision a Redis Instance
+
+Supabase doesn't offer a native Redis service. You'll need to use an external Redis provider.
+* **Recommended:** **Upstash Redis** is a popular choice for serverless environments due to its serverless, HTTP-based API, which works well with Edge Functions.
+* **Alternatives:** Redis Cloud, or any other Redis provider where you can get a connection URL and API key/password.
+
+Once you have your Redis instance, note down its connection URL and any necessary authentication tokens. You'll store these as Supabase Edge Function secrets.
+
+### 2. Set Up Supabase Edge Function Secrets
+
+To securely store your Redis connection details and OpenAI API key, use Supabase Secrets.
+
+Go to your Supabase project dashboard -> **Edge Functions** -> **Secrets**.
+Add the following secrets:
+
+* `OPENAI_API_KEY`: Your OpenAI API key.
+* `REDIS_URL`: Your Redis connection URL (e.g., `redis://<host>:<port>` or `rediss://<host>:<port>` for SSL).
+* `REDIS_TOKEN`: (Optional, but highly recommended for Upstash) Your Redis authentication token.
+
+### 3. Create Your Supabase Edge Function (Deno)
+
+Now, let's write the Edge Function code. You'll use Langchain's built-in caching mechanisms, specifically `RedisCache` (for exact match caching) or `RedisSemanticCache` (for semantic caching).
+
+**Project Structure (simplified):**
+
+```
+supabase/
+└── functions/
+    └── agent_function/
+        └── index.ts
+```
+
+**`supabase/functions/agent_function/index.ts`**
+
+```typescript
+import { serve } from 'https://deno.land/std@0.131.0/http/server.ts';
+import { createClient } from 'npm:@supabase/supabase-js@^2'; // Supabase client for DB interaction
+import { Redis } from 'npm:ioredis@^5'; // A popular Redis client compatible with Deno
+import { ChatOpenAI, OpenAIEmbeddings } from 'npm:@langchain/openai@^0.0.28'; // Your LLM and Embeddings
+import { RedisCache, RedisSemanticCache } from 'npm:@langchain/community/caches/ioredis@^0.0.28'; // Langchain Redis caches
+import { set and get } from 'npm:@langchain/core/globals@^0.0.28'; // For setting global cache
+
+// Ensure CORS headers are included for local development or if called from a different origin
+import { corsHeaders } from '../_shared/cors.ts';
+
+// Initialize Supabase client
+const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!
+);
+
+// --- Initialize Redis Client ---
+// Use environment variables for secure access
+const REDIS_URL = Deno.env.get('REDIS_URL');
+const REDIS_TOKEN = Deno.env.get('REDIS_TOKEN'); // For Upstash or other providers using token auth
+
+if (!REDIS_URL) {
+    throw new Error('REDIS_URL environment variable is not set.');
+}
+
+const redisConfig: ConstructorParameters<typeof Redis>[0] = {
+    host: new URL(REDIS_URL).hostname,
+    port: parseInt(new URL(REDIS_URL).port || '6379'),
+    password: REDIS_TOKEN, // Pass token as password for Upstash
+    tls: REDIS_URL.startsWith('rediss://') ? {} : undefined, // Enable TLS for secure connections
+};
+
+const redisClient = new Redis(redisConfig);
+
+// --- Configure Langchain Cache ---
+
+// Option 1: Exact Match Caching (RedisCache)
+const exactMatchCache = new RedisCache(redisClient, {
+    ttl: 3600, // Cache entries expire after 1 hour (in seconds)
+    prefix: 'langchain:exact:', // Optional prefix for keys in Redis
+});
+
+// Option 2: Semantic Caching (RedisSemanticCache)
+// Requires an embeddings model to convert prompts into vectors
+const embeddings = new OpenAIEmbeddings({
+    apiKey: Deno.env.get('OPENAI_API_KEY')!,
+    modelName: 'text-embedding-ada-002', // Or 'text-embedding-3-small', 'text-embedding-3-large'
+});
+
+const semanticCache = new RedisSemanticCache(embeddings, {
+    redisClient: redisClient,
+    ttl: 3600, // Cache entries expire after 1 hour
+    distanceThreshold: 0.1, // Adjust this threshold (0 to 1, lower is stricter similarity)
+    prefix: 'langchain:semantic:',
+});
+
+// Set the desired cache globally for Langchain
+// Use set_llm_cache if you want to use it for all LLM calls
+// For specific chains, you can pass the cache directly
+set_llm_cache(semanticCache); // or exactMatchCache for exact matching
+
+// Initialize your LLM
+const chat = new ChatOpenAI({
+    openAIApiKey: Deno.env.get('OPENAI_API_KEY')!,
+    modelName: 'gpt-4o-mini', // Or your preferred LLM
+    temperature: 0.7,
+});
+
+// Your AI Agent logic goes here (simplified for demonstration)
+// This could be a Langchain Agent, Chain, or just a direct LLM call
+async function runAgent(prompt: string, userId: string) {
+    // Example: Interacting with Supabase DB (e.g., retrieving user context)
+    const { data: userData, error: userError } = await supabase
+        .from('user_profiles')
+        .select('name, preferences')
+        .eq('id', userId)
+        .single();
+
+    let fullPrompt = prompt;
+    if (userData) {
+        fullPrompt = `User: ${userData.name}, Preferences: ${JSON.stringify(userData.preferences)}. ${prompt}`;
+    }
+
+    // This LLM call will now automatically use the global cache
+    const response = await chat.invoke(fullPrompt);
+
+    // Example: Writing to Supabase DB (e.g., logging interaction)
+    const { error: logError } = await supabase.from('agent_logs').insert({
+        user_id: userId,
+        prompt: prompt,
+        full_prompt: fullPrompt,
+        response: response,
+        cached: (response as any).response_metadata?.is_cached || false, // Check if Langchain marked it as cached
+    });
+
+    if (logError) {
+        console.error('Error logging interaction:', logError.message);
+    }
+
+    return response;
+}
+
+// Supabase Edge Function handler
+serve(async (req) => {
+    // Handle CORS preflight requests
+    if (req.method === 'OPTIONS') {
+        return new Response('ok', { headers: corsHeaders });
+    }
+
+    try {
+        const { prompt, user_id } = await req.json(); // Assuming JSON payload with prompt and user_id
+
+        if (!prompt || !user_id) {
+            return new Response(
+                JSON.stringify({ error: 'Missing prompt or user_id' }),
+                { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+            );
+        }
+
+        const agentResponse = await runAgent(prompt, user_id);
+
+        return new Response(
+            JSON.stringify({ response: agentResponse.content }),
+            { headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+        );
+
+    } catch (error) {
+        console.error('Edge Function Error:', error.message);
+        return new Response(
+            JSON.stringify({ error: `An error occurred: ${error.message}` }),
+            { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+        );
+    }
+});
+```
+
+**`supabase/functions/_shared/cors.ts`** (standard CORS headers)
+
+```typescript
+export const corsHeaders = {
+  'Access-Control-Allow-Origin': '*', // Adjust this to your frontend's origin in production
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+};
+```
+
+### 4. Deploy Your Edge Function
+
+From your Supabase project directory, use the Supabase CLI:
+
+```bash
+supabase functions deploy agent_function --no-verify-jwt --env-file .env.build --project-ref your_project_ref
+```
+* `--no-verify-jwt`: If your function is publicly accessible or you handle auth internally.
+* `--env-file .env.build`: (Optional, but recommended for local testing) If you have a local `.env.build` file with your secrets. For deployment to Supabase, it will pick up secrets from the dashboard.
+* `your_project_ref`: Your Supabase project ID.
+
+### Explanation and Key Points:
+
+1.  **Deno Compatibility:**
+    * Supabase Edge Functions run Deno, which means you typically import modules via URLs (e.g., `https://deno.land/std/...` or `https://esm.sh/...`).
+    * For `npm` packages, Deno now has good `npm:` specifier support (`npm:package-name@version`). This is what's used for `ioredis`, `@langchain/openai`, `@langchain/community`, and `@langchain/core`.
+    * **Important:** Ensure your `npm` package versions are compatible with the Deno runtime on Supabase. Check the latest `@langchain/community` documentation for supported Deno versions and import methods.
+
+2.  **Redis Client (`ioredis`):**
+    * `ioredis` is a robust and widely used Redis client that can be used in Deno. It supports both standard Redis URLs and connections with SSL/TLS (`rediss://`).
+    * Make sure your `REDIS_URL` is correctly formatted and includes `rediss://` if your Redis provider requires SSL (which is common for cloud Redis services like Upstash).
+    * The `password` field for `ioredis` is typically used for the `REDIS_TOKEN` from Upstash.
+
+3.  **Langchain Caching Classes:**
+    * **`RedisCache`**: For strict, exact-match caching. It creates a hash of the prompt and LLM configuration as the key. Ideal for very specific and repetitive queries (e.g., "What is the capital of France?").
+    * **`RedisSemanticCache`**: For more intelligent caching based on semantic similarity. It uses an `Embeddings` model (like `OpenAIEmbeddings`) to convert queries into vectors and then performs a vector similarity search in Redis. This is generally more effective for conversational AI where users might phrase the same question differently. You'll need to set a `distanceThreshold` to determine how similar two queries must be to trigger a cache hit.
+    * **`set_llm_cache(yourCacheInstance)`**: This global function in Langchain configures a global cache that all subsequent LLM calls within that Langchain instance will automatically use. This is the simplest way to integrate caching across your agent.
+
+4.  **`ttl` (Time-To-Live):**
+    * Always set a `ttl` for your cache entries. LLM responses can become outdated. For general knowledge, an hour or a day might be fine. For dynamic data, you'd want a much shorter TTL.
+
+5.  **`prefix`:**
+    * Using prefixes (e.g., `langchain:exact:` or `langchain:semantic:`) helps organize your keys in Redis, especially if you have other Redis data.
+
+6.  **Error Handling and Logging:**
+    * Implement robust `try-catch` blocks.
+    * Log errors to the Supabase logs.
+    * Consider logging cache hits/misses to monitor the effectiveness of your caching strategy.
+
+7.  **`user_id` for Context (Important for Agents):**
+    * If your agent's responses are personalized or depend on user-specific history/data, you *must* include `user_id` (or some unique session ID) in your cache key (for `RedisCache`) or as part of the content embedded (for `RedisSemanticCache`) to ensure cache coherence. The example `cacheKey` in the `runAgent` function shows this for `RedisCache`. For `RedisSemanticCache`, you'd typically embed the *full context* sent to the LLM.
+
+8.  **Supabase Database Integration:**
+    * The example includes reading user preferences from `user_profiles` and logging interactions to `agent_logs`. This demonstrates how your Edge Function seamlessly connects to your Supabase Postgres database.
+
+This setup provides a robust and cost-effective way to run your Langchain AI agents on Supabase Edge Functions, leveraging caching to minimize redundant LLM API calls and improve performance.
